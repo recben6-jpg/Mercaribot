@@ -29,6 +29,9 @@ SEARCH_TERMS = [
     "ポケモン レア まとめ",
 ]
 
+# Mercari category "ポケモンカードゲーム" — keeps One Piece, Duel Masters etc. out
+POKEMON_CATEGORY_ID = os.environ.get("CATEGORY_ID", "1289")
+
 SEEN_FILE    = "seen_ids.json"
 FORCE_FILE   = "force_search.flag"   # touch this file to trigger immediate search
 MAX_SEEN     = 5000
@@ -99,7 +102,7 @@ def interruptible_sleep(seconds: int) -> bool:
 # ─── MERCARI PAGE SCRAPE ──────────────────────────────────────────────────────
 
 def build_url(keyword: str) -> str:
-    return f"https://jp.mercari.com/search?keyword={quote(keyword)}&status=on_sale&sort=created_time&order=desc"
+    return f"https://jp.mercari.com/search?keyword={quote(keyword)}&category_id={POKEMON_CATEGORY_ID}&status=on_sale&sort=created_time&order=desc"
 
 
 _PW = None
