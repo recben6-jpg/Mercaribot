@@ -3,9 +3,10 @@ import time
 import json
 import os
 import sys
-import uuid
+import re
 import logging
 from datetime import datetime
+from urllib.parse import quote
 
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -20,7 +21,7 @@ log = logging.getLogger("mercari-bot")
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
 PRICE_THRESHOLD = int(os.environ.get("PRICE_THRESHOLD", "500"))
 CHECK_INTERVAL  = int(os.environ.get("CHECK_INTERVAL",  "300"))
-REQUEST_DELAY   = float(os.environ.get("REQUEST_DELAY",  "12"))
+REQUEST_DELAY   = float(os.environ.get("REQUEST_DELAY",  "15"))
 
 SEARCH_TERMS = [
     "フルアート まとめ",
@@ -34,15 +35,21 @@ MAX_SEEN    = 5000
 MAX_RETRIES = 3
 RETRY_DELAY = 15
 
-MERCARI_URL = "https://api.mercari.jp/v2/entities:search"
-
 CONDITION_MAP = {
-    "ITEM_CONDITION_ID_1": "New",
-    "ITEM_CONDITION_ID_2": "Like new",
-    "ITEM_CONDITION_ID_3": "Good",
-    "ITEM_CONDITION_ID_4": "Fair",
-    "ITEM_CONDITION_ID_5": "Poor",
+    "1": "New",
+    "2": "Like new",
+    "3": "Good",
+    "4": "Fair",
+    "5": "Poor",
 }
+
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent":       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept":           "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language":  "ja,en;q=0.9",
+    "Accept-Encoding":  "gzip, deflate, br",
+})
 
 # ─── SEEN IDs ─────────────────────────────────────────────────────────────────
 
@@ -64,61 +71,80 @@ def save_seen(seen: set) -> None:
     except OSError as e:
         log.warning(f"Could not save seen file: {e}")
 
-# ─── MERCARI ──────────────────────────────────────────────────────────────────
+# ─── MERCARI PAGE SCRAPE ──────────────────────────────────────────────────────
 
-def make_headers() -> dict:
-    from mercari_dpop import generate_dpop_jwt
-    dpop_token = generate_dpop_jwt(str(uuid.uuid4()), "POST", MERCARI_URL)
-    return {
-        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept":          "application/json",
-        "Accept-Language": "ja,en;q=0.9",
-        "Content-Type":    "application/json",
-        "X-Platform":      "web",
-        "DPoP":            dpop_token,
-        "Referer":         "https://jp.mercari.com/",
-    }
+def build_url(keyword: str) -> str:
+    return f"https://jp.mercari.com/search?keyword={quote(keyword)}&status=on_sale&sort=created_time&order=desc"
 
 
-def build_payload(keyword: str) -> dict:
-    return {
-        "pageSize": 30,
-        "pageToken": "",
-        "searchCondition": {
-            "keyword":        keyword,
-            "excludeKeyword": "",
-            "sort":           "SORT_CREATED_TIME",
-            "order":          "ORDER_DESC",
-            "status":         ["STATUS_ON_SALE"],
-            "categoryId":     [],
-            "brandId":        [],
-            "itemTypes":      [],
-            "skuTypes":       [],
-            "colorIds":       [],
-            "priceMin":       0,
-        },
-        "defaultDatasets":    ["DATASET_TYPE_MERCARI"],
-        "serviceFrom":        "suruga",
-        "withItemBrand":      True,
-        "withItemSize":       False,
-        "withItemPromotions": False,
-        "withItemSizes":      False,
-        "withShopname":       False,
-    }
+def parse_items_from_html(html: str) -> list:
+    """Extract items from __NEXT_DATA__ JSON embedded in the page."""
+    match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.DOTALL)
+    if not match:
+        log.warning("__NEXT_DATA__ not found in page")
+        return []
+
+    try:
+        data = json.loads(match.group(1))
+    except json.JSONDecodeError as e:
+        log.warning(f"Failed to parse __NEXT_DATA__: {e}")
+        return []
+
+    # Walk the Next.js data tree to find items
+    # Path can vary — try common locations
+    items = []
+    try:
+        props = data.get("props", {}).get("pageProps", {})
+
+        # Try direct items key
+        raw = (
+            props.get("items")
+            or props.get("searchResult", {}).get("items")
+            or props.get("initialData", {}).get("result", {}).get("items")
+            or []
+        )
+
+        for item in raw:
+            # Normalise fields across different response shapes
+            item_id   = item.get("id") or item.get("itemId", "")
+            name      = item.get("name") or item.get("itemName", "Unknown")
+            price_raw = item.get("price") or item.get("itemPrice", 0)
+            price     = int(str(price_raw).replace(",", "").replace("¥", "").strip()) if price_raw else 0
+            condition = str(item.get("itemConditionId") or item.get("condition", {}).get("id", ""))
+            thumb     = ""
+            thumbs    = item.get("thumbnails") or item.get("itemImages") or []
+            if thumbs:
+                thumb = thumbs[0] if isinstance(thumbs[0], str) else thumbs[0].get("url", "")
+
+            if item_id and price:
+                items.append({
+                    "id":              item_id,
+                    "name":            name,
+                    "price":           price,
+                    "itemConditionId": condition,
+                    "thumbnails":      [thumb] if thumb else [],
+                })
+    except Exception as e:
+        log.warning(f"Error walking __NEXT_DATA__: {e}")
+
+    return items
 
 
 def search_mercari(keyword: str) -> list:
+    url = build_url(keyword)
+
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            r = requests.post(
-                MERCARI_URL,
-                json=build_payload(keyword),
-                headers=make_headers(),
-                timeout=20,
-            )
+            r = SESSION.get(url, timeout=25)
             if r.status_code == 200:
-                return r.json().get("items", [])
-            log.warning(f"HTTP {r.status_code} for '{keyword}' (attempt {attempt}/{MAX_RETRIES})")
+                items = parse_items_from_html(r.text)
+                if items:
+                    return items
+                # Page returned OK but no items found in HTML structure
+                log.warning(f"Page OK but 0 items parsed for '{keyword}' (attempt {attempt})")
+            else:
+                log.warning(f"HTTP {r.status_code} for '{keyword}' (attempt {attempt}/{MAX_RETRIES})")
+
         except requests.exceptions.Timeout:
             log.warning(f"Timeout for '{keyword}' (attempt {attempt}/{MAX_RETRIES})")
         except requests.exceptions.ConnectionError:
@@ -155,7 +181,7 @@ def notify_hit(item: dict, keyword: str) -> None:
     name      = item.get("name", "Unknown item")
     url       = item_url(item)
     thumb     = (item.get("thumbnails") or [""])[0]
-    condition = CONDITION_MAP.get(item.get("itemConditionId", ""), "Unknown")
+    condition = CONDITION_MAP.get(str(item.get("itemConditionId", "")), "Unknown")
 
     embed = {
         "title":       f"🎴  ¥{price}  —  under threshold",
@@ -239,15 +265,15 @@ def run() -> None:
 
     while True:
         cycle += 1
-        cycle_found  = 0
-        cheapest_item: dict | None = None
+        cycle_found   = 0
+        cheapest_item = None
 
         log.info(f"── Cycle {cycle} ──────────────────────")
 
         for keyword in SEARCH_TERMS:
             log.info(f"Searching: {keyword}")
             items = search_mercari(keyword)
-            log.info(f"  {len(items)} results returned")
+            log.info(f"  {len(items)} results parsed")
 
             for item in items:
                 item_id = item.get("id")
@@ -256,7 +282,6 @@ def run() -> None:
                 if not item_id:
                     continue
 
-                # Track cheapest across all results
                 if cheapest_item is None or price < cheapest_item.get("price", 99_999):
                     cheapest_item = item
 
@@ -275,7 +300,8 @@ def run() -> None:
             time.sleep(REQUEST_DELAY)
 
         if cycle_found == 0:
-            log.info(f"Cycle {cycle} — nothing found. Cheapest: ¥{cheapest_item.get('price') if cheapest_item else 'N/A'}")
+            cheapest_price = cheapest_item.get("price") if cheapest_item else "N/A"
+            log.info(f"Cycle {cycle} — nothing found. Cheapest: ¥{cheapest_price}")
             notify_nothing_found(cycle, cheapest_item)
         else:
             log.info(f"Cycle {cycle} done — {cycle_found} hits (total: {total_found}).")
