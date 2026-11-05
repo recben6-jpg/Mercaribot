@@ -29,9 +29,9 @@ SEARCH_TERMS = [
 ]
 
 SEEN_FILE   = "seen_ids.json"
-MAX_SEEN    = 5000   # cap memory to avoid file growing forever
+MAX_SEEN    = 5000
 MAX_RETRIES = 3
-RETRY_DELAY = 20     # seconds between retries on failure
+RETRY_DELAY = 20
 
 HEADERS = {
     "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -39,6 +39,14 @@ HEADERS = {
     "Accept-Language": "ja,en;q=0.9",
     "X-Platform":      "web",
     "Referer":         "https://jp.mercari.com/",
+}
+
+CONDITION_MAP = {
+    "ITEM_CONDITION_ID_1": "New",
+    "ITEM_CONDITION_ID_2": "Like new",
+    "ITEM_CONDITION_ID_3": "Good",
+    "ITEM_CONDITION_ID_4": "Fair",
+    "ITEM_CONDITION_ID_5": "Poor",
 }
 
 # ─── SEEN IDs ─────────────────────────────────────────────────────────────────
@@ -54,7 +62,6 @@ def load_seen() -> set:
 
 
 def save_seen(seen: set) -> None:
-    # Trim oldest entries if cap exceeded (keep as list for ordering)
     trimmed = list(seen)[-MAX_SEEN:]
     try:
         with open(SEEN_FILE, "w") as f:
@@ -65,6 +72,8 @@ def save_seen(seen: set) -> None:
 # ─── MERCARI ──────────────────────────────────────────────────────────────────
 
 def build_payload(keyword: str) -> dict:
+    # No priceMax filter — we fetch all results and filter client-side
+    # so we can also report the cheapest item found above threshold
     return {
         "pageSize": 30,
         "pageToken": "",
@@ -79,7 +88,6 @@ def build_payload(keyword: str) -> dict:
             "itemTypes":      [],
             "skuTypes":       [],
             "colorIds":       [],
-            "priceMax":       PRICE_THRESHOLD,
             "priceMin":       0,
         },
         "defaultDatasets":    ["DATASET_TYPE_MERCARI"],
@@ -97,17 +105,10 @@ def search_mercari(keyword: str) -> list:
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            r = requests.post(
-                url,
-                json=build_payload(keyword),
-                headers=HEADERS,
-                timeout=20,
-            )
+            r = requests.post(url, json=build_payload(keyword), headers=HEADERS, timeout=20)
             if r.status_code == 200:
                 return r.json().get("items", [])
-
             log.warning(f"HTTP {r.status_code} for '{keyword}' (attempt {attempt}/{MAX_RETRIES})")
-
         except requests.exceptions.Timeout:
             log.warning(f"Timeout for '{keyword}' (attempt {attempt}/{MAX_RETRIES})")
         except requests.exceptions.ConnectionError:
@@ -135,43 +136,53 @@ def discord_post(payload: dict) -> bool:
         return False
 
 
-def notify_item(item: dict, keyword: str) -> None:
-    price   = item.get("price", "?")
-    name    = item.get("name", "Unknown item")
-    item_id = item.get("id", "")
-    url     = f"https://jp.mercari.com/item/{item_id}"
-    thumb   = (item.get("thumbnails") or [""])[0]
+def item_url(item: dict) -> str:
+    return f"https://jp.mercari.com/item/{item.get('id', '')}"
 
-    condition_map = {
-        "ITEM_CONDITION_ID_1": "New",
-        "ITEM_CONDITION_ID_2": "Like new",
-        "ITEM_CONDITION_ID_3": "Good",
-        "ITEM_CONDITION_ID_4": "Fair",
-        "ITEM_CONDITION_ID_5": "Poor",
-    }
-    condition = condition_map.get(
-        item.get("itemConditionId", ""), "Unknown condition"
-    )
+
+def notify_hit(item: dict, keyword: str) -> None:
+    price     = item.get("price", "?")
+    name      = item.get("name", "Unknown item")
+    url       = item_url(item)
+    thumb     = (item.get("thumbnails") or [""])[0]
+    condition = CONDITION_MAP.get(item.get("itemConditionId", ""), "Unknown")
 
     embed = {
         "title":       f"🎴  ¥{price}  —  under threshold",
-        "description": f"**{name}**",
+        "description": f"**[{name}]({url})**",
         "url":         url,
-        "color":       0x5865F2,   # Discord blurple
+        "color":       0x5865F2,
         "fields": [
             {"name": "Price",     "value": f"¥{price}",          "inline": True},
             {"name": "Threshold", "value": f"¥{PRICE_THRESHOLD}", "inline": True},
             {"name": "Condition", "value": condition,             "inline": True},
             {"name": "Query",     "value": f"`{keyword}`",        "inline": False},
         ],
-        "footer": {
-            "text": f"Mercari Japan Bot  •  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        },
+        "footer": {"text": f"Mercari Japan Bot  •  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"},
     }
     if thumb:
         embed["thumbnail"] = {"url": thumb}
 
     discord_post({"embeds": [embed]})
+
+
+def notify_nothing_found(cycle: int, cheapest: dict | None) -> None:
+    if cheapest:
+        price = cheapest.get("price", "?")
+        name  = cheapest.get("name", "Unknown")[:60]
+        url   = item_url(cheapest)
+        note  = f"Closest listing: **¥{price}** — [{name}]({url})"
+    else:
+        note = "No listings returned at all — Mercari may have blocked the request."
+
+    discord_post({
+        "embeds": [{
+            "title":       f"🔍  Cycle {cycle} — nothing under ¥{PRICE_THRESHOLD}",
+            "description": note,
+            "color":       0x95a5a6,
+            "footer":      {"text": f"Mercari Japan Bot  •  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"},
+        }]
+    })
 
 
 def notify_startup() -> None:
@@ -206,7 +217,7 @@ def notify_error(message: str) -> None:
 
 def run() -> None:
     if not DISCORD_WEBHOOK:
-        log.error("DISCORD_WEBHOOK environment variable is not set. Exiting.")
+        log.error("DISCORD_WEBHOOK not set. Exiting.")
         sys.exit(1)
 
     log.info(f"Starting — threshold ¥{PRICE_THRESHOLD}, interval {CHECK_INTERVAL}s, delay {REQUEST_DELAY}s")
@@ -219,6 +230,8 @@ def run() -> None:
     while True:
         cycle += 1
         cycle_found = 0
+        cheapest_item: dict | None = None   # cheapest item seen this cycle regardless of threshold
+
         log.info(f"── Cycle {cycle} ──────────────────────")
 
         for keyword in SEARCH_TERMS:
@@ -232,21 +245,32 @@ def run() -> None:
 
                 if not item_id:
                     continue
+
+                # Track cheapest item across all results (above or below threshold)
+                if cheapest_item is None or price < cheapest_item.get("price", 99_999):
+                    cheapest_item = item
+
+                # Only notify/track hits under threshold that we haven't seen
                 if item_id in seen:
                     continue
                 if price > PRICE_THRESHOLD:
                     continue
 
                 log.info(f"  → HIT  ¥{price}  {item.get('name', '')[:60]}")
-                notify_item(item, keyword)
+                notify_hit(item, keyword)
                 seen.add(item_id)
-                cycle_found  += 1
-                total_found  += 1
+                cycle_found += 1
+                total_found += 1
 
             save_seen(seen)
             time.sleep(REQUEST_DELAY)
 
-        log.info(f"Cycle {cycle} done — {cycle_found} new hits (total: {total_found}). Sleeping {CHECK_INTERVAL}s.")
+        if cycle_found == 0:
+            log.info(f"Cycle {cycle} — nothing found. Cheapest seen: ¥{cheapest_item.get('price') if cheapest_item else 'N/A'}")
+            notify_nothing_found(cycle, cheapest_item)
+        else:
+            log.info(f"Cycle {cycle} done — {cycle_found} hits (total: {total_found}). Sleeping {CHECK_INTERVAL}s.")
+
         time.sleep(CHECK_INTERVAL)
 
 
