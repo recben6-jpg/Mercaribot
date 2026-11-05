@@ -3,6 +3,7 @@ import time
 import json
 import os
 import sys
+import uuid
 import logging
 from datetime import datetime
 
@@ -17,29 +18,23 @@ log = logging.getLogger("mercari-bot")
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
-PRICE_THRESHOLD = int(os.environ.get("PRICE_THRESHOLD", "500"))   # yen
-CHECK_INTERVAL  = int(os.environ.get("CHECK_INTERVAL",  "300"))   # seconds
-REQUEST_DELAY   = float(os.environ.get("REQUEST_DELAY",  "12"))   # seconds between searches
+PRICE_THRESHOLD = int(os.environ.get("PRICE_THRESHOLD", "500"))
+CHECK_INTERVAL  = int(os.environ.get("CHECK_INTERVAL",  "300"))
+REQUEST_DELAY   = float(os.environ.get("REQUEST_DELAY",  "12"))
 
 SEARCH_TERMS = [
-    "フルアート まとめ",        # full art bulk
-    "SR まとめ",               # Super Rare bulk
-    "ポケモン カード まとめ",   # Pokémon card bulk
-    "ポケモン レア まとめ",     # Pokémon rare bulk
+    "フルアート まとめ",
+    "SR まとめ",
+    "ポケモン カード まとめ",
+    "ポケモン レア まとめ",
 ]
 
 SEEN_FILE   = "seen_ids.json"
 MAX_SEEN    = 5000
 MAX_RETRIES = 3
-RETRY_DELAY = 20
+RETRY_DELAY = 15
 
-HEADERS = {
-    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept":          "application/json",
-    "Accept-Language": "ja,en;q=0.9",
-    "X-Platform":      "web",
-    "Referer":         "https://jp.mercari.com/",
-}
+MERCARI_URL = "https://api.mercari.jp/v2/entities:search"
 
 CONDITION_MAP = {
     "ITEM_CONDITION_ID_1": "New",
@@ -71,9 +66,21 @@ def save_seen(seen: set) -> None:
 
 # ─── MERCARI ──────────────────────────────────────────────────────────────────
 
+def make_headers() -> dict:
+    from mercari_dpop import generate_dpop_jwt
+    dpop_token = generate_dpop_jwt(str(uuid.uuid4()), "POST", MERCARI_URL)
+    return {
+        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept":          "application/json",
+        "Accept-Language": "ja,en;q=0.9",
+        "Content-Type":    "application/json",
+        "X-Platform":      "web",
+        "DPoP":            dpop_token,
+        "Referer":         "https://jp.mercari.com/",
+    }
+
+
 def build_payload(keyword: str) -> dict:
-    # No priceMax filter — we fetch all results and filter client-side
-    # so we can also report the cheapest item found above threshold
     return {
         "pageSize": 30,
         "pageToken": "",
@@ -101,11 +108,14 @@ def build_payload(keyword: str) -> dict:
 
 
 def search_mercari(keyword: str) -> list:
-    url = "https://api.mercari.jp/v2/entities:search"
-
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            r = requests.post(url, json=build_payload(keyword), headers=HEADERS, timeout=20)
+            r = requests.post(
+                MERCARI_URL,
+                json=build_payload(keyword),
+                headers=make_headers(),
+                timeout=20,
+            )
             if r.status_code == 200:
                 return r.json().get("items", [])
             log.warning(f"HTTP {r.status_code} for '{keyword}' (attempt {attempt}/{MAX_RETRIES})")
@@ -173,7 +183,7 @@ def notify_nothing_found(cycle: int, cheapest: dict | None) -> None:
         url   = item_url(cheapest)
         note  = f"Closest listing: **¥{price}** — [{name}]({url})"
     else:
-        note = "No listings returned at all — Mercari may have blocked the request."
+        note = "No listings returned — Mercari may be temporarily unavailable."
 
     discord_post({
         "embeds": [{
@@ -220,7 +230,7 @@ def run() -> None:
         log.error("DISCORD_WEBHOOK not set. Exiting.")
         sys.exit(1)
 
-    log.info(f"Starting — threshold ¥{PRICE_THRESHOLD}, interval {CHECK_INTERVAL}s, delay {REQUEST_DELAY}s")
+    log.info(f"Starting — threshold ¥{PRICE_THRESHOLD}, interval {CHECK_INTERVAL}s")
     notify_startup()
 
     seen        = load_seen()
@@ -229,8 +239,8 @@ def run() -> None:
 
     while True:
         cycle += 1
-        cycle_found = 0
-        cheapest_item: dict | None = None   # cheapest item seen this cycle regardless of threshold
+        cycle_found  = 0
+        cheapest_item: dict | None = None
 
         log.info(f"── Cycle {cycle} ──────────────────────")
 
@@ -246,11 +256,10 @@ def run() -> None:
                 if not item_id:
                     continue
 
-                # Track cheapest item across all results (above or below threshold)
+                # Track cheapest across all results
                 if cheapest_item is None or price < cheapest_item.get("price", 99_999):
                     cheapest_item = item
 
-                # Only notify/track hits under threshold that we haven't seen
                 if item_id in seen:
                     continue
                 if price > PRICE_THRESHOLD:
@@ -266,10 +275,10 @@ def run() -> None:
             time.sleep(REQUEST_DELAY)
 
         if cycle_found == 0:
-            log.info(f"Cycle {cycle} — nothing found. Cheapest seen: ¥{cheapest_item.get('price') if cheapest_item else 'N/A'}")
+            log.info(f"Cycle {cycle} — nothing found. Cheapest: ¥{cheapest_item.get('price') if cheapest_item else 'N/A'}")
             notify_nothing_found(cycle, cheapest_item)
         else:
-            log.info(f"Cycle {cycle} done — {cycle_found} hits (total: {total_found}). Sleeping {CHECK_INTERVAL}s.")
+            log.info(f"Cycle {cycle} done — {cycle_found} hits (total: {total_found}).")
 
         time.sleep(CHECK_INTERVAL)
 
