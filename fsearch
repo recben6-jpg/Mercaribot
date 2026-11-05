@@ -1,0 +1,3 @@
+#!/bin/sh
+touch force_search.flag
+echo "Force search triggered; bot will run next cycle immediately."

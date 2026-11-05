@@ -30,10 +30,12 @@ SEARCH_TERMS = [
     "ポケモン レア まとめ",
 ]
 
-SEEN_FILE   = "seen_ids.json"
-MAX_SEEN    = 5000
-MAX_RETRIES = 3
-RETRY_DELAY = 15
+SEEN_FILE    = "seen_ids.json"
+FORCE_FILE   = "force_search.flag"   # touch this file to trigger immediate search
+MAX_SEEN     = 5000
+MAX_RETRIES  = 3
+RETRY_DELAY  = 15
+SLEEP_TICK   = 5    # seconds between flag checks during sleep
 
 CONDITION_MAP = {
     "1": "New",
@@ -70,6 +72,30 @@ def save_seen(seen: set) -> None:
             json.dump(trimmed, f)
     except OSError as e:
         log.warning(f"Could not save seen file: {e}")
+
+# ─── FORCE SEARCH ─────────────────────────────────────────────────────────────
+
+def check_force() -> bool:
+    """Return True and remove the flag file if a force search was requested."""
+    if os.path.exists(FORCE_FILE):
+        try:
+            os.remove(FORCE_FILE)
+        except OSError:
+            pass
+        return True
+    return False
+
+
+def interruptible_sleep(seconds: int) -> bool:
+    """Sleep in SLEEP_TICK chunks, return True immediately if force flag appears."""
+    elapsed = 0
+    while elapsed < seconds:
+        if check_force():
+            log.info("Force search flag detected — skipping remaining sleep")
+            return True
+        time.sleep(SLEEP_TICK)
+        elapsed += SLEEP_TICK
+    return False
 
 # ─── MERCARI PAGE SCRAPE ──────────────────────────────────────────────────────
 
@@ -306,7 +332,11 @@ def run() -> None:
         else:
             log.info(f"Cycle {cycle} done — {cycle_found} hits (total: {total_found}).")
 
-        time.sleep(CHECK_INTERVAL)
+        log.info(f"Sleeping {CHECK_INTERVAL}s — run 'fsearch' in Railway console to force now")
+        forced = interruptible_sleep(CHECK_INTERVAL)
+        if forced:
+            discord_post({"embeds": [{"title": "⚡  Force search triggered", "color": 0xFEE75C,
+                "footer": {"text": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}}]})
 
 
 if __name__ == "__main__":
