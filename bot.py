@@ -2,10 +2,13 @@ import requests
 import time
 import json
 import os
+import re
 import sys
 import logging
 from datetime import datetime
 from urllib.parse import quote
+
+import db
 
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -31,6 +34,12 @@ SEARCH_TERMS = [
 
 # Mercari category "ポケモンカードゲーム" — keeps One Piece, Duel Masters etc. out
 POKEMON_CATEGORY_ID = os.environ.get("CATEGORY_ID", "1289")
+
+# CZK conversion: live JPY->CZK rate (cached), falling back to JPY_TO_CZK.
+# PROXY_FEE_JPY is the forwarding service's per-item fee, added to the CZK estimate.
+JPY_TO_CZK_FALLBACK = float(os.environ.get("JPY_TO_CZK", "0.14"))
+PROXY_FEE_JPY       = int(os.environ.get("PROXY_FEE_JPY", "0"))
+MIN_SCORE           = int(os.environ.get("MIN_SCORE", "0"))  # only alert hits with potential >= this
 
 # Anti-spam settings
 MAX_ALERTS_PER_CYCLE = int(os.environ.get("MAX_ALERTS_PER_CYCLE", "10"))  # extra hits are summarised
@@ -154,6 +163,11 @@ def normalise_items(raw: list) -> list:
                     "price":           price,
                     "itemConditionId": str(item.get("itemConditionId", "")),
                     "thumbnails":      (item.get("thumbnails") or [])[:1],
+                    "categoryId":      str(item.get("categoryId", "")),
+                    "sellerId":        str(item.get("sellerId", "")),
+                    "itemType":        item.get("itemType", ""),
+                    "created":         item.get("created", ""),
+                    "raw":             item,
                 })
         except (ValueError, AttributeError):
             continue
@@ -224,23 +238,91 @@ def item_url(item: dict) -> str:
     return f"https://jp.mercari.com/item/{item.get('id', '')}"
 
 
+# ─── CZK + POTENTIAL ──────────────────────────────────────────────────────────
+
+_rate = {"value": JPY_TO_CZK_FALLBACK, "fetched": 0.0}
+
+
+def jpy_to_czk_rate() -> float:
+    """Live JPY->CZK rate, refreshed every 6 h; falls back to JPY_TO_CZK."""
+    if time.time() - _rate["fetched"] > 6 * 3600:
+        _rate["fetched"] = time.time()  # also throttles retries after a failure
+        try:
+            r = requests.get("https://open.er-api.com/v6/latest/JPY", timeout=10)
+            _rate["value"] = float(r.json()["rates"]["CZK"])
+            log.info(f"JPY->CZK rate: {_rate['value']:.4f}")
+        except Exception as e:
+            log.warning(f"Could not fetch JPY->CZK rate, using {_rate['value']}: {e}")
+    return _rate["value"]
+
+
+def czk(jpy: int) -> int:
+    return round(jpy * jpy_to_czk_rate())
+
+
+CONDITION_POINTS = {"1": 40, "2": 32, "3": 22, "4": 10, "5": 0}
+# rarity words in the title -> points (highest match wins)
+RARITY_POINTS = [
+    (30, r"PSA\s?10|BGS\s?10|SAR|UR\b|HR\b|SSR|BWR|CSR|CHR|ミラー|プロモ|PROMO"),
+    (20, r"\bSR\b|\bAR\b|RRR|\bRR\b|\bSRD\b|キラ|レア|ホロ"),
+    (10, r"\bex\b|\bV\b|VMAX|VSTAR|\bGX\b|\bEX\b|フルアート|まとめ|セット"),
+]
+GOOD_WORDS = r"美品|新品|未開封|未使用|極美品|傷なし"
+BAD_WORDS  = r"ジャンク|傷あり|傷有|汚れ|折れ|曲がり|難あり|プレイ用|状態悪"
+
+
+def card_count(name: str) -> int:
+    m = re.search(r"(\d{1,4})\s*(?:枚|点|個|コ)", name)
+    return int(m.group(1)) if m else 1
+
+
+def potential_score(item: dict) -> int:
+    """0-100 heuristic: condition (40) + rarity words (30) + bulk size (10) + price (20).
+    Not a market valuation, it ranks which cheap listings look best."""
+    name = item.get("name", "")
+    score = CONDITION_POINTS.get(str(item.get("itemConditionId", "")), 10)
+    score += next((pts for pts, rx in RARITY_POINTS if re.search(rx, name, re.I)), 0)
+    if re.search(GOOD_WORDS, name):
+        score += 5
+    if re.search(BAD_WORDS, name):
+        score -= 15
+    score += min(card_count(name), 100) // 10          # up to +10 for bulk lots
+    price = max(item.get("price", 0), 1)
+    per_card = price / card_count(name)
+    score += round(20 * max(0.0, 1 - per_card / max(PRICE_THRESHOLD, 1)))  # cheaper per card = more
+    return max(0, min(100, score))
+
+
+def potential_label(score: int) -> str:
+    return "🔥 Top pick" if score >= 70 else "⭐ Good" if score >= 50 else "🙂 Okay" if score >= 30 else "🪙 Meh"
+
+
 def hit_embed(item: dict, keyword: str) -> dict:
     price     = item.get("price", "?")
     name      = item.get("name", "Unknown item")
     url       = item_url(item)
     thumb     = (item.get("thumbnails") or [""])[0]
     condition = CONDITION_MAP.get(str(item.get("itemConditionId", "")), "Unknown")
+    score     = item.get("score", potential_score(item))
+    n_cards   = card_count(name)
+    price_czk = czk(price)
+    fee_czk   = czk(price + PROXY_FEE_JPY)
 
     embed = {
-        "title":       f"🎴  ¥{price}  —  under threshold",
+        "title":       f"{potential_label(score)}  ·  {price_czk} Kč  (¥{price})",
         "description": f"**[{name}]({url})**",
         "url":         url,
-        "color":       0x5865F2,
+        "color":       0xED4245 if score >= 70 else 0xFEE75C if score >= 50 else 0x5865F2,
         "fields": [
-            {"name": "Price",     "value": f"¥{price}",          "inline": True},
-            {"name": "Threshold", "value": f"¥{PRICE_THRESHOLD}", "inline": True},
-            {"name": "Condition", "value": condition,             "inline": True},
-            {"name": "Query",     "value": f"`{keyword}`",        "inline": False},
+            {"name": "Price",     "value": f"**{price_czk} Kč**\n¥{price}", "inline": True},
+            {"name": "Condition", "value": condition,                        "inline": True},
+            {"name": "Potential", "value": f"{score}/100",                   "inline": True},
+        ] + ([
+            {"name": f"With ¥{PROXY_FEE_JPY} proxy fee", "value": f"{fee_czk} Kč", "inline": True},
+        ] if PROXY_FEE_JPY else []) + ([
+            {"name": "Cards", "value": f"~{n_cards}  ({round(price_czk / n_cards, 1)} Kč each)", "inline": True},
+        ] if n_cards > 1 else []) + [
+            {"name": "Query",     "value": f"`{keyword}`",                   "inline": False},
         ],
         "footer": {"text": f"Mercari Japan Bot  •  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"},
     }
@@ -251,8 +333,8 @@ def hit_embed(item: dict, keyword: str) -> dict:
 
 def notify_hits(hits: list) -> None:
     """Send all new hits of a cycle in as few Discord messages as possible
-    (max 10 embeds per message), cheapest first, capped at MAX_ALERTS_PER_CYCLE."""
-    hits = sorted(hits, key=lambda h: h[0].get("price", 0))
+    (max 10 embeds per message), best potential first, capped at MAX_ALERTS_PER_CYCLE."""
+    hits = sorted(hits, key=lambda h: (-h[0].get("score", 0), h[0].get("price", 0)))
     shown, rest = hits[:MAX_ALERTS_PER_CYCLE], hits[MAX_ALERTS_PER_CYCLE:]
     embeds = [hit_embed(item, kw) for item, kw in shown]
     for i in range(0, len(embeds), 10):
@@ -260,7 +342,7 @@ def notify_hits(hits: list) -> None:
                       "embeds": embeds[i:i + 10]})
         time.sleep(1)
     if rest:
-        discord_post({"content": f"…and {len(rest)} more under ¥{PRICE_THRESHOLD} (cheapest shown above). See the Railway logs."})
+        discord_post({"content": f"…and {len(rest)} more under ¥{PRICE_THRESHOLD} (best shown above). See the Railway logs."})
 
 
 def notify_nothing_found(cycle: int, cheapest: dict | None) -> None:
@@ -322,6 +404,8 @@ def run() -> None:
         notify_startup()
 
     seen        = load_seen()
+    if db.init():
+        seen |= db.load_alerted_ids()   # survives redeploys without a volume
     cycle       = 0
     total_found = 0
 
@@ -337,6 +421,10 @@ def run() -> None:
             log.info(f"Searching: {keyword}")
             items = search_mercari(keyword)
             log.info(f"  {len(items)} results parsed")
+            for it in items:
+                it["score"] = potential_score(it)
+            db.log_listings(items, keyword, jpy_to_czk_rate())
+            hits_before = len(new_hits)
 
             for item in items:
                 item_id = item.get("id")
@@ -352,6 +440,8 @@ def run() -> None:
                     continue
                 if price > PRICE_THRESHOLD:
                     continue
+                if item["score"] < MIN_SCORE:
+                    continue
 
                 log.info(f"  → HIT  ¥{price}  {item.get('name', '')[:60]}")
                 new_hits.append((item, keyword))
@@ -359,11 +449,13 @@ def run() -> None:
                 cycle_found += 1
                 total_found += 1
 
+            db.log_search(cycle, keyword, len(items), len(new_hits) - hits_before)
             save_seen(seen)
             time.sleep(REQUEST_DELAY)
 
         if new_hits:
             notify_hits(new_hits)
+            db.mark_alerted([i["id"] for i, _ in new_hits])
 
         if cycle_found == 0:
             cheapest_price = cheapest_item.get("price") if cheapest_item else "N/A"
