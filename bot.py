@@ -32,7 +32,13 @@ SEARCH_TERMS = [
 # Mercari category "ポケモンカードゲーム" — keeps One Piece, Duel Masters etc. out
 POKEMON_CATEGORY_ID = os.environ.get("CATEGORY_ID", "1289")
 
-SEEN_FILE    = "seen_ids.json"
+# Anti-spam settings
+MAX_ALERTS_PER_CYCLE = int(os.environ.get("MAX_ALERTS_PER_CYCLE", "10"))  # extra hits are summarised
+NOTIFY_EMPTY   = os.environ.get("NOTIFY_EMPTY", "false").lower() == "true"  # "nothing found" message
+NOTIFY_STARTUP = os.environ.get("NOTIFY_STARTUP", "true").lower() == "true"
+DATA_DIR       = os.environ.get("DATA_DIR", ".")  # point at a Railway volume to keep seen IDs across deploys
+
+SEEN_FILE    = os.path.join(DATA_DIR, "seen_ids.json")
 FORCE_FILE   = "force_search.flag"   # touch this file to trigger immediate search
 MAX_SEEN     = 5000
 MAX_RETRIES  = 3
@@ -218,7 +224,7 @@ def item_url(item: dict) -> str:
     return f"https://jp.mercari.com/item/{item.get('id', '')}"
 
 
-def notify_hit(item: dict, keyword: str) -> None:
+def hit_embed(item: dict, keyword: str) -> dict:
     price     = item.get("price", "?")
     name      = item.get("name", "Unknown item")
     url       = item_url(item)
@@ -240,8 +246,21 @@ def notify_hit(item: dict, keyword: str) -> None:
     }
     if thumb:
         embed["thumbnail"] = {"url": thumb}
+    return embed
 
-    discord_post({"embeds": [embed]})
+
+def notify_hits(hits: list) -> None:
+    """Send all new hits of a cycle in as few Discord messages as possible
+    (max 10 embeds per message), cheapest first, capped at MAX_ALERTS_PER_CYCLE."""
+    hits = sorted(hits, key=lambda h: h[0].get("price", 0))
+    shown, rest = hits[:MAX_ALERTS_PER_CYCLE], hits[MAX_ALERTS_PER_CYCLE:]
+    embeds = [hit_embed(item, kw) for item, kw in shown]
+    for i in range(0, len(embeds), 10):
+        discord_post({"content": f"🎴 {len(hits)} new listing(s) under ¥{PRICE_THRESHOLD}" if i == 0 else "",
+                      "embeds": embeds[i:i + 10]})
+        time.sleep(1)
+    if rest:
+        discord_post({"content": f"…and {len(rest)} more under ¥{PRICE_THRESHOLD} (cheapest shown above). See the Railway logs."})
 
 
 def notify_nothing_found(cycle: int, cheapest: dict | None) -> None:
@@ -299,7 +318,8 @@ def run() -> None:
         sys.exit(1)
 
     log.info(f"Starting — threshold ¥{PRICE_THRESHOLD}, interval {CHECK_INTERVAL}s")
-    notify_startup()
+    if NOTIFY_STARTUP:
+        notify_startup()
 
     seen        = load_seen()
     cycle       = 0
@@ -309,6 +329,7 @@ def run() -> None:
         cycle += 1
         cycle_found   = 0
         cheapest_item = None
+        new_hits      = []
 
         log.info(f"── Cycle {cycle} ──────────────────────")
 
@@ -333,7 +354,7 @@ def run() -> None:
                     continue
 
                 log.info(f"  → HIT  ¥{price}  {item.get('name', '')[:60]}")
-                notify_hit(item, keyword)
+                new_hits.append((item, keyword))
                 seen.add(item_id)
                 cycle_found += 1
                 total_found += 1
@@ -341,18 +362,19 @@ def run() -> None:
             save_seen(seen)
             time.sleep(REQUEST_DELAY)
 
+        if new_hits:
+            notify_hits(new_hits)
+
         if cycle_found == 0:
             cheapest_price = cheapest_item.get("price") if cheapest_item else "N/A"
             log.info(f"Cycle {cycle} — nothing found. Cheapest: ¥{cheapest_price}")
-            notify_nothing_found(cycle, cheapest_item)
+            if NOTIFY_EMPTY:
+                notify_nothing_found(cycle, cheapest_item)
         else:
             log.info(f"Cycle {cycle} done — {cycle_found} hits (total: {total_found}).")
 
         log.info(f"Sleeping {CHECK_INTERVAL}s — run 'fsearch' in Railway console to force now")
-        forced = interruptible_sleep(CHECK_INTERVAL)
-        if forced:
-            discord_post({"embeds": [{"title": "⚡  Force search triggered", "color": 0xFEE75C,
-                "footer": {"text": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}}]})
+        interruptible_sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":
