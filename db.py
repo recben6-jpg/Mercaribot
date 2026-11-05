@@ -55,6 +55,13 @@ def _get():
         _conn.autocommit = True
         with _conn.cursor() as cur:
             cur.execute(SCHEMA)
+            cur.execute("CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY, ran_at TIMESTAMPTZ DEFAULT now())")
+            # one-time cleanup of the old "store everything" data (TRUNCATE returns the disk space immediately)
+            cur.execute("SELECT 1 FROM migrations WHERE name = 'wipe_v1'")
+            if not cur.fetchone():
+                cur.execute("TRUNCATE listings, searches RESTART IDENTITY")
+                cur.execute("INSERT INTO migrations (name) VALUES ('wipe_v1')")
+                log.info("Database wiped once (migration wipe_v1)")
         log.info("Database connected, schema ready")
     return _conn
 
