@@ -41,6 +41,8 @@ JPY_TO_CZK_FALLBACK = float(os.environ.get("JPY_TO_CZK", "0.14"))
 PROXY_FEE_JPY       = int(os.environ.get("PROXY_FEE_JPY", "0"))
 MIN_SCORE           = int(os.environ.get("MIN_SCORE", "0"))  # only alert hits with potential >= this
 
+DB_RETENTION_DAYS   = int(os.environ.get("DB_RETENTION_DAYS", "90"))  # alerted listings kept this long
+
 # Anti-spam settings
 MAX_ALERTS_PER_CYCLE = int(os.environ.get("MAX_ALERTS_PER_CYCLE", "10"))  # extra hits are summarised
 NOTIFY_EMPTY   = os.environ.get("NOTIFY_EMPTY", "false").lower() == "true"  # "nothing found" message
@@ -167,7 +169,6 @@ def normalise_items(raw: list) -> list:
                     "sellerId":        str(item.get("sellerId", "")),
                     "itemType":        item.get("itemType", ""),
                     "created":         item.get("created", ""),
-                    "raw":             item,
                 })
         except (ValueError, AttributeError):
             continue
@@ -415,6 +416,7 @@ def run() -> None:
         cheapest_item = None
         new_hits      = []
 
+        db.prune(DB_RETENTION_DAYS)
         log.info(f"── Cycle {cycle} ──────────────────────")
 
         for keyword in SEARCH_TERMS:
@@ -423,7 +425,6 @@ def run() -> None:
             log.info(f"  {len(items)} results parsed")
             for it in items:
                 it["score"] = potential_score(it)
-            db.log_listings(items, keyword, jpy_to_czk_rate())
             hits_before = len(new_hits)
 
             for item in items:
@@ -455,7 +456,7 @@ def run() -> None:
 
         if new_hits:
             notify_hits(new_hits)
-            db.mark_alerted([i["id"] for i, _ in new_hits])
+            db.log_hits(new_hits, jpy_to_czk_rate())
 
         if cycle_found == 0:
             cheapest_price = cheapest_item.get("price") if cheapest_item else "N/A"
