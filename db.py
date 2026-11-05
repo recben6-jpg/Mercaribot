@@ -1,6 +1,5 @@
 """Optional Postgres logging. Every function is a no-op (and never raises)
 when DATABASE_URL is unset or the database is unreachable, so the bot keeps running."""
-import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -36,10 +35,11 @@ CREATE TABLE IF NOT EXISTS listings (
     first_seen       TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_seen        TIMESTAMPTZ NOT NULL DEFAULT now(),
     times_seen       INT NOT NULL DEFAULT 1,
-    alerted          BOOLEAN NOT NULL DEFAULT FALSE,
-    alerted_at       TIMESTAMPTZ,
-    raw              JSONB
+    alerted          BOOLEAN NOT NULL DEFAULT TRUE,
+    alerted_at       TIMESTAMPTZ DEFAULT now()
 );
+-- slim down from the earlier version that stored every listing with its raw JSON
+ALTER TABLE listings DROP COLUMN IF EXISTS raw;
 CREATE INDEX IF NOT EXISTS listings_price_idx ON listings (price_jpy);
 CREATE INDEX IF NOT EXISTS listings_first_seen_idx ON listings (first_seen DESC);
 """
@@ -94,42 +94,42 @@ def load_alerted_ids() -> set:
     if not conn:
         return set()
     with conn.cursor() as cur:
-        cur.execute("SELECT id FROM listings WHERE alerted")
+        cur.execute("SELECT id FROM listings")  # only alerted listings are stored
         return {r[0] for r in cur.fetchall()}
 
 
 @_safe
-def log_listings(items: list, keyword: str, czk_rate: float) -> None:
-    """Upsert every listing seen in a search (not only hits)."""
+def log_hits(hits: list, czk_rate: float) -> None:
+    """Store only the listings that triggered an alert (small rows, no raw JSON)."""
     conn = _get()
-    if not conn or not items:
+    if not conn or not hits:
         return
     from psycopg2.extras import execute_values
     rows = [(
         i["id"], i.get("name"), i.get("price"), round(i.get("price", 0) * czk_rate, 2),
         i.get("itemConditionId"), i.get("categoryId"), i.get("sellerId"), i.get("itemType"),
         f"https://jp.mercari.com/item/{i['id']}", (i.get("thumbnails") or [""])[0],
-        keyword, i.get("score"), _ts(i.get("created")), json.dumps(i.get("raw", {}), ensure_ascii=False),
-    ) for i in items]
+        kw, i.get("score"), _ts(i.get("created")), True, datetime.now(timezone.utc),
+    ) for i, kw in hits]
     with conn.cursor() as cur:
         execute_values(cur, """
             INSERT INTO listings (id, name, price_jpy, price_czk, condition_id, category_id, seller_id,
-                                  item_type, url, thumbnail, keyword, score, listed_at, raw)
+                                  item_type, url, thumbnail, keyword, score, listed_at, alerted, alerted_at)
             VALUES %s
-            ON CONFLICT (id) DO UPDATE SET
-                price_jpy = EXCLUDED.price_jpy, price_czk = EXCLUDED.price_czk,
-                score = EXCLUDED.score, last_seen = now(),
-                times_seen = listings.times_seen + 1, raw = EXCLUDED.raw
-        """, rows, template="(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)")
+            ON CONFLICT (id) DO UPDATE SET price_jpy = EXCLUDED.price_jpy, price_czk = EXCLUDED.price_czk,
+                last_seen = now(), times_seen = listings.times_seen + 1
+        """, rows)
 
 
 @_safe
-def mark_alerted(ids: list) -> None:
+def prune(listing_days: int = 90, search_days: int = 14) -> None:
+    """Retention so the database cannot grow without bound."""
     conn = _get()
-    if not conn or not ids:
+    if not conn:
         return
     with conn.cursor() as cur:
-        cur.execute("UPDATE listings SET alerted = TRUE, alerted_at = now() WHERE id = ANY(%s)", (ids,))
+        cur.execute("DELETE FROM searches WHERE ts < now() - make_interval(days => %s)", (search_days,))
+        cur.execute("DELETE FROM listings WHERE first_seen < now() - make_interval(days => %s)", (listing_days,))
 
 
 @_safe
