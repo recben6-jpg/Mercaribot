@@ -3,7 +3,6 @@ import time
 import json
 import os
 import sys
-import re
 import logging
 from datetime import datetime
 from urllib.parse import quote
@@ -103,81 +102,95 @@ def build_url(keyword: str) -> str:
     return f"https://jp.mercari.com/search?keyword={quote(keyword)}&status=on_sale&sort=created_time&order=desc"
 
 
-def parse_items_from_html(html: str) -> list:
-    """Extract items from __NEXT_DATA__ JSON embedded in the page."""
-    match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.DOTALL)
-    if not match:
-        log.warning("__NEXT_DATA__ not found in page")
-        return []
+_PW = None
+_BROWSER = None
+_CONTEXT = None
 
-    try:
-        data = json.loads(match.group(1))
-    except json.JSONDecodeError as e:
-        log.warning(f"Failed to parse __NEXT_DATA__: {e}")
-        return []
 
-    # Walk the Next.js data tree to find items
-    # Path can vary — try common locations
-    items = []
-    try:
-        props = data.get("props", {}).get("pageProps", {})
-
-        # Try direct items key
-        raw = (
-            props.get("items")
-            or props.get("searchResult", {}).get("items")
-            or props.get("initialData", {}).get("result", {}).get("items")
-            or []
+def _get_context():
+    """Lazily start one headless Chromium and reuse it across searches."""
+    global _PW, _BROWSER, _CONTEXT
+    if _CONTEXT is None:
+        from playwright.sync_api import sync_playwright
+        _PW = sync_playwright().start()
+        _BROWSER = _PW.chromium.launch(args=["--no-sandbox"])
+        _CONTEXT = _BROWSER.new_context(
+            locale="ja-JP",
+            user_agent=SESSION.headers["User-Agent"],
         )
+    return _CONTEXT
 
-        for item in raw:
-            # Normalise fields across different response shapes
-            item_id   = item.get("id") or item.get("itemId", "")
-            name      = item.get("name") or item.get("itemName", "Unknown")
-            price_raw = item.get("price") or item.get("itemPrice", 0)
-            price     = int(str(price_raw).replace(",", "").replace("¥", "").strip()) if price_raw else 0
-            condition = str(item.get("itemConditionId") or item.get("condition", {}).get("id", ""))
-            thumb     = ""
-            thumbs    = item.get("thumbnails") or item.get("itemImages") or []
-            if thumbs:
-                thumb = thumbs[0] if isinstance(thumbs[0], str) else thumbs[0].get("url", "")
 
+def _reset_browser() -> None:
+    global _PW, _BROWSER, _CONTEXT
+    for obj, fn in ((_BROWSER, "close"), (_PW, "stop")):
+        try:
+            if obj:
+                getattr(obj, fn)()
+        except Exception:
+            pass
+    _PW = _BROWSER = _CONTEXT = None
+
+
+def normalise_items(raw: list) -> list:
+    items = []
+    for item in raw:
+        try:
+            item_id = item.get("id", "")
+            price = int(str(item.get("price", 0)).replace(",", "") or 0)
             if item_id and price:
                 items.append({
                     "id":              item_id,
-                    "name":            name,
+                    "name":            item.get("name", "Unknown"),
                     "price":           price,
-                    "itemConditionId": condition,
-                    "thumbnails":      [thumb] if thumb else [],
+                    "itemConditionId": str(item.get("itemConditionId", "")),
+                    "thumbnails":      (item.get("thumbnails") or [])[:1],
                 })
-    except Exception as e:
-        log.warning(f"Error walking __NEXT_DATA__: {e}")
-
+        except (ValueError, AttributeError):
+            continue
     return items
 
 
 def search_mercari(keyword: str) -> list:
+    """Load the search page in a real browser and capture the search API response
+    (the page is client-rendered, so there is no data in the raw HTML)."""
     url = build_url(keyword)
 
     for attempt in range(1, MAX_RETRIES + 1):
+        page = None
         try:
-            r = SESSION.get(url, timeout=25)
-            if r.status_code == 200:
-                items = parse_items_from_html(r.text)
+            page = _get_context().new_page()
+            captured = []
+
+            def on_response(resp):
+                if "entities:search" in resp.url and resp.status == 200:
+                    try:
+                        captured.append(resp.json())
+                    except Exception:
+                        pass
+
+            page.on("response", on_response)
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            for _ in range(30):  # up to ~30s for the search API call
+                if captured:
+                    break
+                page.wait_for_timeout(1000)
+            if captured:
+                items = normalise_items(captured[-1].get("items", []))
                 if items:
                     return items
-                # Page returned OK but no items found in HTML structure
-                log.warning(f"Page OK but 0 items parsed for '{keyword}' (attempt {attempt})")
+                log.warning(f"Search API returned 0 items for '{keyword}' (attempt {attempt})")
             else:
-                log.warning(f"HTTP {r.status_code} for '{keyword}' (attempt {attempt}/{MAX_RETRIES})")
-
-        except requests.exceptions.Timeout:
-            log.warning(f"Timeout for '{keyword}' (attempt {attempt}/{MAX_RETRIES})")
-        except requests.exceptions.ConnectionError:
-            log.warning(f"Connection error for '{keyword}' (attempt {attempt}/{MAX_RETRIES})")
+                log.warning(f"No search API response seen for '{keyword}' (attempt {attempt}/{MAX_RETRIES})")
         except Exception as e:
-            log.error(f"Unexpected error for '{keyword}': {e}")
-            break
+            log.warning(f"Browser error for '{keyword}' (attempt {attempt}/{MAX_RETRIES}): {e}")
+            _reset_browser()
+        finally:
+            try:
+                if page:
+                    page.close()
+            except Exception:
+                pass
 
         if attempt < MAX_RETRIES:
             time.sleep(RETRY_DELAY)
