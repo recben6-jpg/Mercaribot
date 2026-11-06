@@ -156,6 +156,8 @@ def normalise_items(raw: list) -> list:
     items = []
     for item in raw:
         try:
+            if item.get("auction"):  # bid-only listing, can't be bought now
+                continue
             item_id = item.get("id", "")
             price = int(str(item.get("price", 0)).replace(",", "") or 0)
             if item_id and price:
