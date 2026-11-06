@@ -39,7 +39,7 @@ POKEMON_CATEGORY_ID = os.environ.get("CATEGORY_ID", "1289")
 # PROXY_FEE_JPY is the forwarding service's per-item fee, added to the CZK estimate.
 JPY_TO_CZK_FALLBACK = float(os.environ.get("JPY_TO_CZK", "0.14"))
 PROXY_FEE_JPY       = int(os.environ.get("PROXY_FEE_JPY", "0"))
-MIN_SCORE           = int(os.environ.get("MIN_SCORE", "0"))  # only alert hits with potential >= this
+MIN_SCORE           = int(os.environ.get("MIN_SCORE", "75"))  # only alert hits with potential >= this
 
 DB_RETENTION_DAYS   = int(os.environ.get("DB_RETENTION_DAYS", "90"))  # alerted listings kept this long
 
@@ -156,6 +156,8 @@ def normalise_items(raw: list) -> list:
     items = []
     for item in raw:
         try:
+            if item.get("auction"):  # bid-only listing, can't be bought now
+                continue
             item_id = item.get("id", "")
             price = int(str(item.get("price", 0)).replace(",", "") or 0)
             if item_id and price:
